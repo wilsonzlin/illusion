@@ -36,6 +36,8 @@ use off64::usz;
 use pbkdf2::pbkdf2_hmac_array;
 use percent_encoding::utf8_percent_encode;
 use percent_encoding::CONTROLS;
+use rand::thread_rng;
+use rand::RngCore;
 use rpassword::prompt_password;
 use sha2::Sha256;
 use sha2::Sha512;
@@ -47,12 +49,13 @@ use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::io::BufReader;
 use tokio_util::io::StreamReader;
+use tracing::error;
 use tracing::info;
-use tracing::warn;
 
 const PLAIN_PAGE_SIZE: u64 = 1024 * 4;
+const NONCE_SIZE: usize = 12;
 // 16 bytes for MAC.
-const CIPHER_PAGE_SIZE: u64 = PLAIN_PAGE_SIZE + 16;
+const CIPHER_PAGE_SIZE: u64 = PLAIN_PAGE_SIZE + (NONCE_SIZE as u64) + 16;
 
 fn parse_path(uri: &Uri) -> String {
   // TODO Assert no ambiguous %2F. Assert not empty.
@@ -148,7 +151,7 @@ async fn handle_head_or_get(
         Err(err) => match err.into_service_error() {
           HeadObjectError::NotFound(_) => return Err(StatusCode::NOT_FOUND),
           err => {
-            warn!(
+            error!(
               error_type = err.to_string(),
               error_source = err.source(),
               "unhandled HeadObject error"
@@ -176,7 +179,7 @@ async fn handle_head_or_get(
         Err(err) => match err.into_service_error() {
           GetObjectError::NoSuchKey(_) => return Err(StatusCode::NOT_FOUND),
           err => {
-            warn!(
+            error!(
               error_type = err.to_string(),
               error_source = err.source(),
               "unhandled GetObject error"
@@ -224,43 +227,47 @@ async fn handle_head_or_get(
 
   let content_key = derive_key_for_object(&ctx.content_hkdf, &path);
 
-  Ok(out.body(StreamBody::from(try_stream! {
-    if method == Method::HEAD {
-      return;
-    };
-    let mut reader = BufReader::new(res_body.into_async_read());
-    let mut cipher_buf = vec![0u8; usz!(CIPHER_PAGE_SIZE)];
-    for i in page_start..=page_end.unwrap_or(u64::MAX) {
-      let mut eof = false;
-      let mut read_n = 0;
-      while read_n < cipher_buf.len() {
-        let n = reader.read(&mut cipher_buf[read_n..]).await?;
-        if n == 0 {
-          // EOF.
-          eof = true;
-          break;
+  Ok(
+    out
+      .body(StreamBody::from(try_stream! {
+        if method == Method::HEAD {
+          return;
         };
-        read_n += n;
-      };
-      let cipher_data = &cipher_buf[..read_n];
-      let mut plain_data = content_key.decrypt(Nonce::from_slice(&[0u8; 12]), cipher_data).unwrap();
-      // Trim right first in case left trim (`i == 0`) shifts bytes down.
-      if Some(i) == page_end {
-        let end_rem = (end.unwrap() + 1) % PLAIN_PAGE_SIZE;
-        if end_rem != 0 {
-          plain_data.truncate(usz!(end_rem));
+        let mut reader = BufReader::new(res_body.into_async_read());
+        let mut cipher_buf = vec![0u8; usz!(CIPHER_PAGE_SIZE)];
+        for i in page_start..=page_end.unwrap_or(u64::MAX) {
+          let mut eof = false;
+          let mut read_n = 0;
+          while read_n < cipher_buf.len() {
+            let n = reader.read(&mut cipher_buf[read_n..]).await?;
+            if n == 0 {
+              // EOF.
+              eof = true;
+              break;
+            };
+            read_n += n;
+          };
+          let (nonce, cipher_data) = cipher_buf[..read_n].split_at(NONCE_SIZE);
+          let mut plain_data = content_key.decrypt(Nonce::from_slice(nonce), cipher_data).unwrap();
+          // Trim right first in case left trim (`i == 0`) shifts bytes down.
+          if Some(i) == page_end {
+            let end_rem = (end.unwrap() + 1) % PLAIN_PAGE_SIZE;
+            if end_rem != 0 {
+              plain_data.truncate(usz!(end_rem));
+            };
+          };
+          // This may be both the first and last page, so this is not an `else`.
+          if i == page_start {
+            plain_data.drain(0..usz!(start % PLAIN_PAGE_SIZE));
+          };
+          yield plain_data;
+          if eof {
+            break;
+          };
         };
-      };
-      // This may be both the first and last page, so this is not an `else`.
-      if i == page_start {
-        plain_data.drain(0..usz!(start % PLAIN_PAGE_SIZE));
-      };
-      yield plain_data;
-      if eof {
-        break;
-      };
-    };
-  })).unwrap())
+      }))
+      .unwrap(),
+  )
 }
 
 async fn handle_put(
@@ -282,7 +289,7 @@ async fn handle_put(
   let upload = match res {
     Ok(res) => res,
     Err(err) => {
-      warn!(error = err.to_string(), "failed to create multipart upload");
+      error!(error = err.to_string(), "failed to create multipart upload");
       return StatusCode::INTERNAL_SERVER_ERROR;
     }
   };
@@ -309,7 +316,7 @@ async fn handle_put(
           plain_part_byte_count += n;
         }
         Err(err) => {
-          warn!(error = err.to_string(), "failed to read part");
+          error!(error = err.to_string(), "failed to read part");
           return StatusCode::INTERNAL_SERVER_ERROR;
         }
       };
@@ -317,10 +324,15 @@ async fn handle_put(
     plain_part_buf.truncate(plain_part_byte_count);
     let mut cipher_part_data = Vec::with_capacity(cipher_part_max_size);
     for plain_page in plain_part_buf.chunks(usz!(PLAIN_PAGE_SIZE)) {
+      // TODO Is it a security risk if `plain_page` is very short?
+      // We must use a nonce as we are reusing this content key for all parts.
+      let mut nonce = [0u8; NONCE_SIZE];
+      thread_rng().fill_bytes(&mut nonce);
       let cipher_data = content_key
-        .encrypt(Nonce::from_slice(&[0u8; 12]), plain_page)
+        .encrypt(Nonce::from_slice(&nonce), plain_page)
         .unwrap()
         .to_vec();
+      cipher_part_data.extend_from_slice(&nonce);
       cipher_part_data.extend_from_slice(&cipher_data);
       assert_eq!(cipher_data.len(), plain_page.len() + 16);
     }
@@ -337,7 +349,7 @@ async fn handle_put(
     let res = match res {
       Ok(res) => res,
       Err(err) => {
-        warn!(error = err.to_string(), "failed to upload part");
+        error!(error = err.to_string(), "failed to upload part");
         return StatusCode::INTERNAL_SERVER_ERROR;
       }
     };
@@ -371,7 +383,7 @@ async fn handle_put(
     .send()
     .await
   {
-    warn!(
+    error!(
       error = err.to_string(),
       "failed to complete multipart upload"
     );
