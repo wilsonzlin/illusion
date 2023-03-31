@@ -9,6 +9,12 @@ readme = "README.md"
 authors = ["Wilson Lin <code@wilsonl.in>"]
 edition = "2021"
 
+[profile.release]
+codegen-units = 1
+debug = true
+lto = true
+opt-level = 3
+
 [dependencies]
 aes-gcm = "0.10.1"
 aes-gcm-siv = "0.11.1"
