@@ -14,6 +14,10 @@ use axum::extract::DefaultBodyLimit;
 use axum::extract::OriginalUri;
 use axum::extract::State;
 use axum::headers::Range;
+use axum::http::header::ACCEPT_RANGES;
+use axum::http::header::CONTENT_LENGTH;
+use axum::http::header::CONTENT_RANGE;
+use axum::http::Response;
 use axum::http::StatusCode;
 use axum::http::Uri;
 use axum::routing::get;
@@ -77,12 +81,14 @@ async fn handle_get(
   State(ctx): State<Arc<Ctx>>,
   ranges: Option<TypedHeader<Range>>,
   OriginalUri(uri): OriginalUri,
-) -> Result<StreamBody<impl Stream<Item = Result<Vec<u8>, tokio::io::Error>>>, StatusCode> {
+) -> Result<Response<StreamBody<impl Stream<Item = Result<Vec<u8>, tokio::io::Error>>>>, StatusCode>
+{
   assert!(ranges
     .as_ref()
     .filter(|ranges| ranges.iter().count() > 1)
     .is_none());
   let range = ranges
+    .as_ref()
     .and_then(|ranges| ranges.iter().next())
     .unwrap_or((Bound::Unbounded, Bound::Unbounded));
   let start = match range.0 {
@@ -103,10 +109,13 @@ async fn handle_get(
     Bound::Excluded(v) => Some(v - 1),
     Bound::Unbounded => None,
   };
+  if end.is_some() && start > end.unwrap() {
+    return Err(StatusCode::RANGE_NOT_SATISFIABLE);
+  };
   // Inclusive.
-  let plain_page_start = start / PLAIN_PAGE_SIZE;
+  let page_start = start / PLAIN_PAGE_SIZE;
   // Inclusive because `end` is inclusive.
-  let plain_page_end = end.map(|end| end / PLAIN_PAGE_SIZE);
+  let page_end = end.map(|end| end / PLAIN_PAGE_SIZE);
   let path_enc = ctx.encrypted_path(&uri);
   let res = ctx
     .client
@@ -115,8 +124,8 @@ async fn handle_get(
     .key(path_enc)
     .range(format!(
       "bytes={}-{}",
-      plain_page_start * CIPHER_PAGE_SIZE,
-      plain_page_end
+      page_start * CIPHER_PAGE_SIZE,
+      page_end
         .map(|e| ((e + 1) * CIPHER_PAGE_SIZE - 1).to_string())
         .unwrap_or_default()
     ))
@@ -137,10 +146,45 @@ async fn handle_get(
     },
   };
 
-  Ok(StreamBody::from(try_stream! {
+  // We don't want to make a separate extra request to get full object size, so we parse from Content-Range. We can't use Content-Length because that's only the range request length, not the full object size. Also remember that these Content-* values are for the encrypted format, not original, and are page aligned, not exact [start, end].
+  let object_size: u64 = {
+    let raw = res.content_range().unwrap();
+    let raw = raw.strip_prefix("bytes ").unwrap();
+    let (_, size_enc_raw) = raw.split_once('/').unwrap();
+    let size_enc: u64 = size_enc_raw.parse().unwrap();
+    let whole_pages = size_enc / CIPHER_PAGE_SIZE;
+    let rem = size_enc % CIPHER_PAGE_SIZE;
+    let mut sz = whole_pages * PLAIN_PAGE_SIZE;
+    if rem != 0 {
+      sz += rem - (CIPHER_PAGE_SIZE - PLAIN_PAGE_SIZE);
+    };
+    sz
+  };
+  // TODO object_size may be zero.
+  let resolved_end = end.unwrap_or(object_size - 1);
+  if start > resolved_end {
+    return Err(StatusCode::RANGE_NOT_SATISFIABLE);
+  };
+
+  let mut out = Response::builder();
+  out = out.status(if ranges.is_some() {
+    StatusCode::PARTIAL_CONTENT
+  } else {
+    StatusCode::OK
+  });
+  out = out.header(ACCEPT_RANGES, "bytes");
+  out = out.header(CONTENT_LENGTH, resolved_end + 1 - start);
+  if ranges.is_some() {
+    out = out.header(
+      CONTENT_RANGE,
+      format!("bytes={start}-{resolved_end}/{object_size}"),
+    );
+  };
+
+  Ok(out.body(StreamBody::from(try_stream! {
     let mut reader = BufReader::new(res.body.into_async_read());
     let mut cipher_buf = vec![0u8; usz!(CIPHER_PAGE_SIZE)];
-    for i in plain_page_start..=plain_page_end.unwrap_or(u64::MAX) {
+    for i in page_start..=page_end.unwrap_or(u64::MAX) {
       let mut eof = false;
       let mut read_n = 0;
       while read_n < cipher_buf.len() {
@@ -155,19 +199,22 @@ async fn handle_get(
       let (nonce, cipher_data) = cipher_buf[..read_n].split_at(usz!(NONCE_SIZE));
       let mut plain_data = ctx.content_key.decrypt(aes_gcm::Nonce::from_slice(nonce), cipher_data).unwrap();
       // Trim right first in case left trim (`i == 0`) shifts bytes down.
-      if Some(i) == plain_page_end && (end.unwrap() + 1) % PLAIN_PAGE_SIZE != 0 {
-        plain_data.truncate(usz!((end.unwrap() + 1) % PLAIN_PAGE_SIZE));
+      if Some(i) == page_end {
+        let end_rem = (end.unwrap() + 1) % PLAIN_PAGE_SIZE;
+        if end_rem != 0 {
+          plain_data.truncate(usz!(end_rem));
+        };
       };
       // This may be both the first and last page, so this is not an `else`.
-      if i == plain_page_start {
-        plain_data.drain(0..usz!(start));
+      if i == page_start {
+        plain_data.drain(0..usz!(start % PLAIN_PAGE_SIZE));
       };
       yield plain_data;
       if eof {
         break;
       };
     };
-  }))
+  })).unwrap())
 }
 
 async fn handle_put(
@@ -229,12 +276,9 @@ async fn handle_put(
         .encrypt(aes_gcm::Nonce::from_slice(&nonce), plain_page)
         .unwrap()
         .to_vec();
-      assert_eq!(
-        u64::try_from(cipher_data.len()).unwrap() + NONCE_SIZE,
-        CIPHER_PAGE_SIZE
-      );
       cipher_part_data.extend_from_slice(&nonce);
       cipher_part_data.extend_from_slice(&cipher_data);
+      assert_eq!(cipher_data.len(), plain_page.len() + 16);
     }
     let res = ctx
       .client
