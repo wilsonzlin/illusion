@@ -17,21 +17,19 @@ opt-level = 3
 
 [dependencies]
 aes-gcm = "0.10.1"
-aes-gcm-siv = "0.11.1"
 async-stream = "0.3.4"
 aws-config = "0.55.0"
 aws-sdk-s3 = { version = "0.25.0", features = ["rt-tokio"] }
 axum = { version = "0.6", features = ["headers"] }
-blake3 = "1.3.3"
 bytes = "1.4.0"
 clap = { version = "4.2.1", features = ["derive"] }
 data-encoding = "2.3.3"
 futures = "0.3.28"
+hkdf = "0.12.3"
 itertools = "0.10.5"
 off64 = "0.3.0"
 pbkdf2 = "0.12.1"
 percent-encoding = "2.2.0"
-rand = "0.8.5"
 rpassword = "7.2.0"
 sha2 = "0.10.6"
 tokio = { version = "1.27.0", features = ["full"] }

@@ -1,7 +1,7 @@
 use aes_gcm::aead::Aead;
 use aes_gcm::Aes256Gcm;
 use aes_gcm::KeyInit;
-use aes_gcm_siv::Aes256GcmSiv;
+use aes_gcm::Nonce;
 use async_stream::try_stream;
 use aws_sdk_s3::operation::get_object::GetObjectError;
 use aws_sdk_s3::operation::head_object::HeadObjectError;
@@ -30,14 +30,14 @@ use clap::Parser;
 use data_encoding::BASE64URL_NOPAD;
 use futures::Stream;
 use futures::TryStreamExt;
+use hkdf::Hkdf;
 use itertools::Itertools;
 use off64::usz;
 use pbkdf2::pbkdf2_hmac_array;
 use percent_encoding::utf8_percent_encode;
 use percent_encoding::CONTROLS;
-use rand::thread_rng;
-use rand::RngCore;
 use rpassword::prompt_password;
+use sha2::Sha256;
 use sha2::Sha512;
 use std::error::Error;
 use std::net::Ipv4Addr;
@@ -51,30 +51,35 @@ use tracing::info;
 use tracing::warn;
 
 const PLAIN_PAGE_SIZE: u64 = 1024 * 4;
-const NONCE_SIZE: u64 = 12;
 // 16 bytes for MAC.
-const CIPHER_PAGE_SIZE: u64 = NONCE_SIZE + PLAIN_PAGE_SIZE + 16;
+const CIPHER_PAGE_SIZE: u64 = PLAIN_PAGE_SIZE + 16;
+
+fn parse_path(uri: &Uri) -> String {
+  // TODO Assert no ambiguous %2F. Assert not empty.
+  utf8_percent_encode(uri.path(), CONTROLS).to_string()
+}
+
+fn derive_key_for_object(master_key: &Hkdf<Sha256>, path: &str) -> Aes256Gcm {
+  // We don't use AES-GCM with one master key as we need to be able to look up and list encrypted object keys from plaintext queries. We also don't use it because there are many, many objects and chance of nonce reuse becomes high. We had tried AES-GCM-SIV, which is resistant to nonce reuse, but this still required generating a nonce, which meant something like hash(object key || secret key)[..12], as the object key could be too short and crackable by itself. Now, with a key per path/object, we don't need a nonce at all.
+  let mut key = [0u8; 32];
+  master_key.expand(path.as_bytes(), &mut key).unwrap();
+  Aes256Gcm::new(&key.try_into().unwrap())
+}
 
 struct Ctx {
   bucket: String,
   client: Client,
-  content_key: Aes256Gcm,
-  path_key: Aes256GcmSiv,
+  path_hkdf: Hkdf<Sha256>,
+  content_hkdf: Hkdf<Sha256>,
 }
 
 impl Ctx {
-  pub fn encrypted_path(&self, uri: &Uri) -> String {
-    // TODO Assert no ambiguous %2F. Assert not empty.
-    let path_plain = utf8_percent_encode(uri.path(), CONTROLS).to_string();
-    // We use AES-GCM-SIV for the path, because we can't use random nonces so we cannot guarantee they won't be reused. To reduce the chance, we derive the nonce from the blake3 hash of the path. We cannot use random nonces because we need to be able to look up a key from its plaintext form, which we wouldn't know how to transform to its encrypted form with a random nonce, unless we performed a ListObjectsV2 every time which is slow. We still use AES-GCM for contents as we can use random nonces there and its algorithm and library is more audited.
-    let path_hash = blake3::hash(path_plain.as_bytes());
-    let path_nonce = aes_gcm_siv::Nonce::from_slice(&path_hash.as_bytes()[..usz!(NONCE_SIZE)]);
-    let mut path_enc = self
-      .path_key
-      .encrypt(path_nonce, path_plain.as_bytes())
+  pub fn encrypted_path(&self, path: &str) -> String {
+    let path_key = derive_key_for_object(&self.path_hkdf, path);
+    let path_enc = path_key
+      .encrypt(Nonce::from_slice(&[0u8; 12]), path.as_bytes())
       .unwrap()
       .to_vec();
-    path_enc.splice(0..0, path_nonce.to_vec());
     BASE64URL_NOPAD.encode(&path_enc)
   }
 }
@@ -119,7 +124,8 @@ async fn handle_head_or_get(
   let page_start = start / PLAIN_PAGE_SIZE;
   // Inclusive because `end` is inclusive.
   let page_end = end.map(|end| end / PLAIN_PAGE_SIZE);
-  let path_enc = ctx.encrypted_path(&uri);
+  let path = parse_path(&uri);
+  let path_enc = ctx.encrypted_path(&path);
   let s3_range = format!(
     "bytes={}-{}",
     page_start * CIPHER_PAGE_SIZE,
@@ -216,6 +222,8 @@ async fn handle_head_or_get(
     );
   };
 
+  let content_key = derive_key_for_object(&ctx.content_hkdf, &path);
+
   Ok(out.body(StreamBody::from(try_stream! {
     if method == Method::HEAD {
       return;
@@ -234,8 +242,8 @@ async fn handle_head_or_get(
         };
         read_n += n;
       };
-      let (nonce, cipher_data) = cipher_buf[..read_n].split_at(usz!(NONCE_SIZE));
-      let mut plain_data = ctx.content_key.decrypt(aes_gcm::Nonce::from_slice(nonce), cipher_data).unwrap();
+      let cipher_data = &cipher_buf[..read_n];
+      let mut plain_data = content_key.decrypt(Nonce::from_slice(&[0u8; 12]), cipher_data).unwrap();
       // Trim right first in case left trim (`i == 0`) shifts bytes down.
       if Some(i) == page_end {
         let end_rem = (end.unwrap() + 1) % PLAIN_PAGE_SIZE;
@@ -262,7 +270,8 @@ async fn handle_put(
 ) -> StatusCode {
   let mut body =
     StreamReader::new(body.map_err(|err| tokio::io::Error::new(tokio::io::ErrorKind::Other, err)));
-  let path_enc = ctx.encrypted_path(&uri);
+  let path = parse_path(&uri);
+  let path_enc = ctx.encrypted_path(&path);
   let res = ctx
     .client
     .create_multipart_upload()
@@ -278,6 +287,7 @@ async fn handle_put(
     }
   };
   let mut parts = Vec::new();
+  let content_key = derive_key_for_object(&ctx.content_hkdf, &path);
   for part_no in 1.. {
     const MAX_PAGES_PER_PART: usize = 1500;
     let plain_part_max_size: usize = usz!(PLAIN_PAGE_SIZE) * MAX_PAGES_PER_PART;
@@ -307,14 +317,10 @@ async fn handle_put(
     plain_part_buf.truncate(plain_part_byte_count);
     let mut cipher_part_data = Vec::with_capacity(cipher_part_max_size);
     for plain_page in plain_part_buf.chunks(usz!(PLAIN_PAGE_SIZE)) {
-      let mut nonce = vec![0u8; usz!(NONCE_SIZE)];
-      thread_rng().fill_bytes(&mut nonce);
-      let cipher_data = ctx
-        .content_key
-        .encrypt(aes_gcm::Nonce::from_slice(&nonce), plain_page)
+      let cipher_data = content_key
+        .encrypt(Nonce::from_slice(&[0u8; 12]), plain_page)
         .unwrap()
         .to_vec();
-      cipher_part_data.extend_from_slice(&nonce);
       cipher_part_data.extend_from_slice(&cipher_data);
       assert_eq!(cipher_data.len(), plain_page.len() + 16);
     }
@@ -397,12 +403,16 @@ async fn main() {
   let config = aws_config::from_env().load().await;
   let client = Client::new(&config);
   let password = prompt_password("Enter your master password: ").unwrap();
-  let key = pbkdf2_hmac_array::<Sha512, 32>(password.as_bytes(), &[], 256_000);
+  // 650,000 is used by 1Password.
+  let key_base = pbkdf2_hmac_array::<Sha512, 64>(password.as_bytes(), &[], 650_000);
+  let path_master_key: [u8; 32] = key_base[..32].try_into().unwrap();
+  let content_master_key: [u8; 32] = key_base[32..].try_into().unwrap();
   let ctx = Arc::new(Ctx {
     bucket: cli.bucket,
     client,
-    path_key: Aes256GcmSiv::new(&key.try_into().unwrap()),
-    content_key: Aes256Gcm::new(&key.try_into().unwrap()),
+    // For extra security, use two different key data instead of the same key data. We use SHA-512 for our PBKDF2 anyway, which outputs in 64-byte blocks, so we may as well use them.
+    path_hkdf: Hkdf::new(None, &path_master_key),
+    content_hkdf: Hkdf::new(None, &content_master_key),
   });
 
   let app = Router::new()
