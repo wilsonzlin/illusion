@@ -4,6 +4,7 @@ use aes_gcm::KeyInit;
 use aes_gcm_siv::Aes256GcmSiv;
 use async_stream::try_stream;
 use aws_sdk_s3::operation::get_object::GetObjectError;
+use aws_sdk_s3::operation::head_object::HeadObjectError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::builders::CompletedMultipartUploadBuilder;
 use aws_sdk_s3::types::builders::CompletedPartBuilder;
@@ -17,10 +18,11 @@ use axum::headers::Range;
 use axum::http::header::ACCEPT_RANGES;
 use axum::http::header::CONTENT_LENGTH;
 use axum::http::header::CONTENT_RANGE;
+use axum::http::Method;
 use axum::http::Response;
 use axum::http::StatusCode;
 use axum::http::Uri;
-use axum::routing::get;
+use axum::routing::head;
 use axum::Router;
 use axum::Server;
 use axum::TypedHeader;
@@ -77,8 +79,9 @@ impl Ctx {
   }
 }
 
-async fn handle_get(
+async fn handle_head_or_get(
   State(ctx): State<Arc<Ctx>>,
+  method: Method,
   ranges: Option<TypedHeader<Range>>,
   OriginalUri(uri): OriginalUri,
 ) -> Result<Response<StreamBody<impl Stream<Item = Result<Vec<u8>, tokio::io::Error>>>>, StatusCode>
@@ -117,49 +120,81 @@ async fn handle_get(
   // Inclusive because `end` is inclusive.
   let page_end = end.map(|end| end / PLAIN_PAGE_SIZE);
   let path_enc = ctx.encrypted_path(&uri);
-  let res = ctx
-    .client
-    .get_object()
-    .bucket(ctx.bucket.clone())
-    .key(path_enc)
-    .range(format!(
-      "bytes={}-{}",
-      page_start * CIPHER_PAGE_SIZE,
-      page_end
-        .map(|e| ((e + 1) * CIPHER_PAGE_SIZE - 1).to_string())
-        .unwrap_or_default()
-    ))
-    .send()
-    .await;
-  let res = match res {
-    Ok(res) => res,
-    Err(err) => match err.into_service_error() {
-      GetObjectError::NoSuchKey(_) => return Err(StatusCode::NOT_FOUND),
-      err => {
-        warn!(
-          error_type = err.to_string(),
-          error_source = err.source(),
-          "unhandled GetObject error"
-        );
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
-      }
-    },
+  let s3_range = format!(
+    "bytes={}-{}",
+    page_start * CIPHER_PAGE_SIZE,
+    page_end
+      .map(|e| ((e + 1) * CIPHER_PAGE_SIZE - 1).to_string())
+      .unwrap_or_default()
+  );
+  let (object_size, res_body) = match method {
+    Method::HEAD => {
+      let res = ctx
+        .client
+        .head_object()
+        .bucket(ctx.bucket.clone())
+        .key(path_enc)
+        .range(s3_range)
+        .send()
+        .await;
+      let res = match res {
+        Ok(res) => res,
+        Err(err) => match err.into_service_error() {
+          HeadObjectError::NotFound(_) => return Err(StatusCode::NOT_FOUND),
+          err => {
+            warn!(
+              error_type = err.to_string(),
+              error_source = err.source(),
+              "unhandled HeadObject error"
+            );
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+          }
+        },
+      };
+      (
+        u64::try_from(res.content_length()).unwrap(),
+        ByteStream::from(Vec::new()),
+      )
+    }
+    Method::GET => {
+      let res = ctx
+        .client
+        .get_object()
+        .bucket(ctx.bucket.clone())
+        .key(path_enc)
+        .range(s3_range)
+        .send()
+        .await;
+      let res = match res {
+        Ok(res) => res,
+        Err(err) => match err.into_service_error() {
+          GetObjectError::NoSuchKey(_) => return Err(StatusCode::NOT_FOUND),
+          err => {
+            warn!(
+              error_type = err.to_string(),
+              error_source = err.source(),
+              "unhandled GetObject error"
+            );
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+          }
+        },
+      };
+      // We don't want to make a separate extra request to get full object size, so we parse from Content-Range. We can't use Content-Length because that's only the range request length, not the full object size. Also remember that these Content-* values are for the encrypted format, not original, and are page aligned, not exact [start, end].
+      let raw = res.content_range().unwrap();
+      let raw = raw.strip_prefix("bytes ").unwrap();
+      let (_, size_enc_raw) = raw.split_once('/').unwrap();
+      let size_enc: u64 = size_enc_raw.parse().unwrap();
+      let whole_pages = size_enc / CIPHER_PAGE_SIZE;
+      let rem = size_enc % CIPHER_PAGE_SIZE;
+      let mut object_size = whole_pages * PLAIN_PAGE_SIZE;
+      if rem != 0 {
+        object_size += rem - (CIPHER_PAGE_SIZE - PLAIN_PAGE_SIZE);
+      };
+      (object_size, res.body)
+    }
+    _ => unreachable!(),
   };
 
-  // We don't want to make a separate extra request to get full object size, so we parse from Content-Range. We can't use Content-Length because that's only the range request length, not the full object size. Also remember that these Content-* values are for the encrypted format, not original, and are page aligned, not exact [start, end].
-  let object_size: u64 = {
-    let raw = res.content_range().unwrap();
-    let raw = raw.strip_prefix("bytes ").unwrap();
-    let (_, size_enc_raw) = raw.split_once('/').unwrap();
-    let size_enc: u64 = size_enc_raw.parse().unwrap();
-    let whole_pages = size_enc / CIPHER_PAGE_SIZE;
-    let rem = size_enc % CIPHER_PAGE_SIZE;
-    let mut sz = whole_pages * PLAIN_PAGE_SIZE;
-    if rem != 0 {
-      sz += rem - (CIPHER_PAGE_SIZE - PLAIN_PAGE_SIZE);
-    };
-    sz
-  };
   // TODO object_size may be zero.
   let resolved_end = end.unwrap_or(object_size - 1);
   if start > resolved_end {
@@ -177,12 +212,15 @@ async fn handle_get(
   if ranges.is_some() {
     out = out.header(
       CONTENT_RANGE,
-      format!("bytes={start}-{resolved_end}/{object_size}"),
+      format!("bytes {start}-{resolved_end}/{object_size}"),
     );
   };
 
   Ok(out.body(StreamBody::from(try_stream! {
-    let mut reader = BufReader::new(res.body.into_async_read());
+    if method == Method::HEAD {
+      return;
+    };
+    let mut reader = BufReader::new(res_body.into_async_read());
     let mut cipher_buf = vec![0u8; usz!(CIPHER_PAGE_SIZE)];
     for i in page_start..=page_end.unwrap_or(u64::MAX) {
       let mut eof = false;
@@ -368,7 +406,11 @@ async fn main() {
   });
 
   let app = Router::new()
-    .fallback(get(handle_get).put(handle_put))
+    .fallback(
+      head(handle_head_or_get)
+        .get(handle_head_or_get)
+        .put(handle_put),
+    )
     .layer(DefaultBodyLimit::disable())
     .with_state(ctx.clone());
 
