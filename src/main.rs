@@ -1,7 +1,3 @@
-use aes_gcm_siv::aead::Aead;
-use aes_gcm_siv::Aes256GcmSiv;
-use aes_gcm_siv::KeyInit;
-use aes_gcm_siv::Nonce;
 use async_stream::try_stream;
 use aws_sdk_s3::operation::get_object::GetObjectError;
 use aws_sdk_s3::operation::head_object::HeadObjectError;
@@ -26,6 +22,10 @@ use axum::routing::head;
 use axum::Router;
 use axum::Server;
 use axum::TypedHeader;
+use chacha20poly1305::aead::Aead;
+use chacha20poly1305::KeyInit;
+use chacha20poly1305::XChaCha20Poly1305;
+use chacha20poly1305::XNonce;
 use clap::Parser;
 use data_encoding::BASE64URL_NOPAD;
 use futures::Stream;
@@ -52,8 +52,8 @@ use tokio_util::io::StreamReader;
 use tracing::error;
 use tracing::info;
 
-const PLAIN_PAGE_SIZE: u64 = 1024 * 4;
-const NONCE_SIZE: usize = 12;
+const PLAIN_PAGE_SIZE: u64 = 1024 * 64;
+const NONCE_SIZE: usize = 24;
 // 16 bytes for MAC.
 const CIPHER_PAGE_SIZE: u64 = PLAIN_PAGE_SIZE + (NONCE_SIZE as u64) + 16;
 
@@ -62,11 +62,10 @@ fn parse_path(uri: &Uri) -> String {
   utf8_percent_encode(uri.path(), CONTROLS).to_string()
 }
 
-fn derive_key_for_object(master_key: &Hkdf<Sha256>, path: &str) -> Aes256GcmSiv {
-  // We don't use AES-GCM with one master key as we need to be able to look up and list encrypted object keys from plaintext queries. We also don't use it because there are many, many objects and chance of nonce reuse becomes high. We had tried AES-GCM-SIV, which is resistant to nonce reuse, but this still required generating a nonce, which meant something like hash(object key || secret key)[..12], as the object key could be too short and crackable by itself. Now, with a key per path/object, we don't need a nonce at all.
+fn derive_key_for_object(master_key: &Hkdf<Sha256>, path: &str) -> XChaCha20Poly1305 {
   let mut key = [0u8; 32];
   master_key.expand(path.as_bytes(), &mut key).unwrap();
-  Aes256GcmSiv::new(&key.try_into().unwrap())
+  XChaCha20Poly1305::new(&key.try_into().unwrap())
 }
 
 struct Ctx {
@@ -81,7 +80,7 @@ impl Ctx {
     let path_key = derive_key_for_object(&self.path_hkdf, path);
     // Nonce reuse is not of concern here; the key is determinstically derived from the path, and the plaintext is always the same, so the output is always the same.
     let path_enc = path_key
-      .encrypt(Nonce::from_slice(&[0u8; 12]), path.as_bytes())
+      .encrypt(XNonce::from_slice(&[0u8; 24]), path.as_bytes())
       .unwrap()
       .to_vec();
     BASE64URL_NOPAD.encode(&path_enc)
@@ -249,7 +248,7 @@ async fn handle_head_or_get(
             read_n += n;
           };
           let (nonce, cipher_data) = cipher_buf[..read_n].split_at(NONCE_SIZE);
-          let mut plain_data = content_key.decrypt(Nonce::from_slice(nonce), cipher_data).unwrap();
+          let mut plain_data = content_key.decrypt(XNonce::from_slice(nonce), cipher_data).unwrap();
           // Trim right first in case left trim (`i == 0`) shifts bytes down.
           if Some(i) == page_end {
             let end_rem = (end.unwrap() + 1) % PLAIN_PAGE_SIZE;
@@ -326,12 +325,12 @@ async fn handle_put(
     let mut cipher_part_data = Vec::with_capacity(cipher_part_max_size);
     for plain_page in plain_part_buf.chunks(usz!(PLAIN_PAGE_SIZE)) {
       // TODO Is it a security risk if `plain_page` is very short?
-      // We must use a nonce as we are reusing this content key for all parts.
-      // It's very unlikely for this nonce to be reused for this content key. There would have to have been 2^48 pages uploaded across all uploads to this object key. However, out of an abundance of caution, we use SIV mode, which prevents catastrophic privacy loss if there is a reuse. Note that we cannot use a counter like `page_no`, as any reupload would immediately lead to nonce reuse.
+      // We must use a nonce as we are reusing this content key for all parts. We use the extended variant of ChaCha20-Poly1305 to reduce reuse chance further.
+      // We cannot use a counter like `page_no`, as any reupload would immediately lead to nonce reuse.
       let mut nonce = [0u8; NONCE_SIZE];
       thread_rng().fill_bytes(&mut nonce);
       let cipher_data = content_key
-        .encrypt(Nonce::from_slice(&nonce), plain_page)
+        .encrypt(XNonce::from_slice(&nonce), plain_page)
         .unwrap()
         .to_vec();
       cipher_part_data.extend_from_slice(&nonce);

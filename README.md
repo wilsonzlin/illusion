@@ -6,3 +6,4 @@ Get, put, and list objects on an S3-compatible service using client-side encrypt
 
 - If the master password is lost, all data will be lost.
 - There is no verification of the master password; entering an incorrect password will likely lead to object keys being mismatched.
+- There is no protection from object data being rearranged or truncated by the S3 sevice.
