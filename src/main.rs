@@ -1,7 +1,7 @@
-use aes_gcm::aead::Aead;
-use aes_gcm::Aes256Gcm;
-use aes_gcm::KeyInit;
-use aes_gcm::Nonce;
+use aes_gcm_siv::aead::Aead;
+use aes_gcm_siv::Aes256GcmSiv;
+use aes_gcm_siv::KeyInit;
+use aes_gcm_siv::Nonce;
 use async_stream::try_stream;
 use aws_sdk_s3::operation::get_object::GetObjectError;
 use aws_sdk_s3::operation::head_object::HeadObjectError;
@@ -62,11 +62,11 @@ fn parse_path(uri: &Uri) -> String {
   utf8_percent_encode(uri.path(), CONTROLS).to_string()
 }
 
-fn derive_key_for_object(master_key: &Hkdf<Sha256>, path: &str) -> Aes256Gcm {
+fn derive_key_for_object(master_key: &Hkdf<Sha256>, path: &str) -> Aes256GcmSiv {
   // We don't use AES-GCM with one master key as we need to be able to look up and list encrypted object keys from plaintext queries. We also don't use it because there are many, many objects and chance of nonce reuse becomes high. We had tried AES-GCM-SIV, which is resistant to nonce reuse, but this still required generating a nonce, which meant something like hash(object key || secret key)[..12], as the object key could be too short and crackable by itself. Now, with a key per path/object, we don't need a nonce at all.
   let mut key = [0u8; 32];
   master_key.expand(path.as_bytes(), &mut key).unwrap();
-  Aes256Gcm::new(&key.try_into().unwrap())
+  Aes256GcmSiv::new(&key.try_into().unwrap())
 }
 
 struct Ctx {
@@ -79,6 +79,7 @@ struct Ctx {
 impl Ctx {
   pub fn encrypted_path(&self, path: &str) -> String {
     let path_key = derive_key_for_object(&self.path_hkdf, path);
+    // Nonce reuse is not of concern here; the key is determinstically derived from the path, and the plaintext is always the same, so the output is always the same.
     let path_enc = path_key
       .encrypt(Nonce::from_slice(&[0u8; 12]), path.as_bytes())
       .unwrap()
@@ -326,6 +327,7 @@ async fn handle_put(
     for plain_page in plain_part_buf.chunks(usz!(PLAIN_PAGE_SIZE)) {
       // TODO Is it a security risk if `plain_page` is very short?
       // We must use a nonce as we are reusing this content key for all parts.
+      // It's very unlikely for this nonce to be reused for this content key. There would have to have been 2^48 pages uploaded across all uploads to this object key. However, out of an abundance of caution, we use SIV mode, which prevents catastrophic privacy loss if there is a reuse. Note that we cannot use a counter like `page_no`, as any reupload would immediately lead to nonce reuse.
       let mut nonce = [0u8; NONCE_SIZE];
       thread_rng().fill_bytes(&mut nonce);
       let cipher_data = content_key
