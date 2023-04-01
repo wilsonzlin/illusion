@@ -23,7 +23,9 @@ use axum::Router;
 use axum::Server;
 use axum::TypedHeader;
 use chacha20poly1305::aead::Aead;
+use chacha20poly1305::ChaCha20Poly1305;
 use chacha20poly1305::KeyInit;
+use chacha20poly1305::Nonce;
 use chacha20poly1305::XChaCha20Poly1305;
 use chacha20poly1305::XNonce;
 use clap::Parser;
@@ -52,6 +54,12 @@ use tokio_util::io::StreamReader;
 use tracing::error;
 use tracing::info;
 
+/*
+
+To prevent ambiguity, an object key (the string used to identify and look up an object in S3) are instead called a "path" throughout this code.
+
+*/
+
 const PLAIN_PAGE_SIZE: u64 = 1024 * 64;
 const NONCE_SIZE: usize = 24;
 // 16 bytes for MAC.
@@ -60,12 +68,6 @@ const CIPHER_PAGE_SIZE: u64 = PLAIN_PAGE_SIZE + (NONCE_SIZE as u64) + 16;
 fn parse_path(uri: &Uri) -> String {
   // TODO Assert no ambiguous %2F. Assert not empty.
   utf8_percent_encode(uri.path(), CONTROLS).to_string()
-}
-
-fn derive_key_for_object(master_key: &Hkdf<Sha256>, path: &str) -> XChaCha20Poly1305 {
-  let mut key = [0u8; 32];
-  master_key.expand(path.as_bytes(), &mut key).unwrap();
-  XChaCha20Poly1305::new(&key.try_into().unwrap())
 }
 
 struct Ctx {
@@ -77,11 +79,22 @@ struct Ctx {
 }
 
 impl Ctx {
-  pub fn object_key(&self, path: &str) -> String {
-    let path_key = derive_key_for_object(&self.path_hkdf, path);
+  pub fn content_key(&self, path: &str) -> XChaCha20Poly1305 {
+    let mut key = [0u8; 32];
+    self.content_hkdf.expand(path.as_bytes(), &mut key).unwrap();
+    XChaCha20Poly1305::new(&key.try_into().unwrap())
+  }
+
+  pub fn encrypted_path(&self, path: &str) -> String {
+    let mut path_key = [0u8; 32];
+    self
+      .path_hkdf
+      .expand(path.as_bytes(), &mut path_key)
+      .unwrap();
+    let path_key = ChaCha20Poly1305::new(&path_key.try_into().unwrap());
     // Nonce reuse is not of concern here; the key is determinstically derived from the path, and the plaintext is always the same, so the output is always the same.
     let path_enc = path_key
-      .encrypt(XNonce::from_slice(&[0u8; 24]), path.as_bytes())
+      .encrypt(Nonce::from_slice(&[0u8; 12]), path.as_bytes())
       .unwrap()
       .to_vec();
     format!(
@@ -133,7 +146,7 @@ async fn handle_head_or_get(
   // Inclusive because `end` is inclusive.
   let page_end = end.map(|end| end / PLAIN_PAGE_SIZE);
   let path = parse_path(&uri);
-  let object_key = ctx.object_key(&path);
+  let path_enc = ctx.encrypted_path(&path);
   let s3_range = format!(
     "bytes={}-{}",
     page_start * CIPHER_PAGE_SIZE,
@@ -147,7 +160,7 @@ async fn handle_head_or_get(
         .client
         .head_object()
         .bucket(ctx.bucket.clone())
-        .key(object_key)
+        .key(path_enc)
         .range(s3_range)
         .send()
         .await;
@@ -175,7 +188,7 @@ async fn handle_head_or_get(
         .client
         .get_object()
         .bucket(ctx.bucket.clone())
-        .key(object_key)
+        .key(path_enc)
         .range(s3_range)
         .send()
         .await;
@@ -230,7 +243,7 @@ async fn handle_head_or_get(
     );
   };
 
-  let content_key = derive_key_for_object(&ctx.content_hkdf, &path);
+  let content_key = ctx.content_key(&path);
 
   Ok(
     out
@@ -283,12 +296,12 @@ async fn handle_put(
   let mut body =
     StreamReader::new(body.map_err(|err| tokio::io::Error::new(tokio::io::ErrorKind::Other, err)));
   let path = parse_path(&uri);
-  let object_key = ctx.object_key(&path);
+  let path_enc = ctx.encrypted_path(&path);
   let res = ctx
     .client
     .create_multipart_upload()
     .bucket(ctx.bucket.clone())
-    .key(object_key.clone())
+    .key(path_enc.clone())
     .send()
     .await;
   let upload = match res {
@@ -299,7 +312,7 @@ async fn handle_put(
     }
   };
   let mut parts = Vec::new();
-  let content_key = derive_key_for_object(&ctx.content_hkdf, &path);
+  let content_key = ctx.content_key(&path);
   for part_no in 1.. {
     const MAX_PAGES_PER_PART: usize = 1500;
     let plain_part_max_size: usize = usz!(PLAIN_PAGE_SIZE) * MAX_PAGES_PER_PART;
@@ -346,7 +359,7 @@ async fn handle_put(
       .client
       .upload_part()
       .bucket(ctx.bucket.clone())
-      .key(object_key.clone())
+      .key(path_enc.clone())
       .upload_id(upload.upload_id().unwrap())
       .part_number(part_no)
       .body(ByteStream::from(cipher_part_data))
@@ -368,7 +381,7 @@ async fn handle_put(
     .client
     .complete_multipart_upload()
     .bucket(ctx.bucket.clone())
-    .key(object_key.clone())
+    .key(path_enc.clone())
     .upload_id(upload.upload_id().unwrap())
     .multipart_upload(
       CompletedMultipartUploadBuilder::default()
