@@ -56,7 +56,7 @@ use tracing::info;
 
 /*
 
-To prevent ambiguity, an object key (the string used to identify and look up an object in S3) are instead called a "path" throughout this code.
+To prevent ambiguity, an object key (the string used to identify and look up an object in S3) is instead called a "path" throughout this code. This way, "key" always refers to encryption, not identification.
 
 */
 
