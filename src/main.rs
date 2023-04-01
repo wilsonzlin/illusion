@@ -71,19 +71,24 @@ fn derive_key_for_object(master_key: &Hkdf<Sha256>, path: &str) -> XChaCha20Poly
 struct Ctx {
   bucket: String,
   client: Client,
+  object_key_public_prefix: String,
   path_hkdf: Hkdf<Sha256>,
   content_hkdf: Hkdf<Sha256>,
 }
 
 impl Ctx {
-  pub fn encrypted_path(&self, path: &str) -> String {
+  pub fn object_key(&self, path: &str) -> String {
     let path_key = derive_key_for_object(&self.path_hkdf, path);
     // Nonce reuse is not of concern here; the key is determinstically derived from the path, and the plaintext is always the same, so the output is always the same.
     let path_enc = path_key
       .encrypt(XNonce::from_slice(&[0u8; 24]), path.as_bytes())
       .unwrap()
       .to_vec();
-    BASE64URL_NOPAD.encode(&path_enc)
+    format!(
+      "{}{}",
+      self.object_key_public_prefix,
+      BASE64URL_NOPAD.encode(&path_enc)
+    )
   }
 }
 
@@ -128,7 +133,7 @@ async fn handle_head_or_get(
   // Inclusive because `end` is inclusive.
   let page_end = end.map(|end| end / PLAIN_PAGE_SIZE);
   let path = parse_path(&uri);
-  let path_enc = ctx.encrypted_path(&path);
+  let object_key = ctx.object_key(&path);
   let s3_range = format!(
     "bytes={}-{}",
     page_start * CIPHER_PAGE_SIZE,
@@ -142,7 +147,7 @@ async fn handle_head_or_get(
         .client
         .head_object()
         .bucket(ctx.bucket.clone())
-        .key(path_enc)
+        .key(object_key)
         .range(s3_range)
         .send()
         .await;
@@ -170,7 +175,7 @@ async fn handle_head_or_get(
         .client
         .get_object()
         .bucket(ctx.bucket.clone())
-        .key(path_enc)
+        .key(object_key)
         .range(s3_range)
         .send()
         .await;
@@ -278,12 +283,12 @@ async fn handle_put(
   let mut body =
     StreamReader::new(body.map_err(|err| tokio::io::Error::new(tokio::io::ErrorKind::Other, err)));
   let path = parse_path(&uri);
-  let path_enc = ctx.encrypted_path(&path);
+  let object_key = ctx.object_key(&path);
   let res = ctx
     .client
     .create_multipart_upload()
     .bucket(ctx.bucket.clone())
-    .key(path_enc.clone())
+    .key(object_key.clone())
     .send()
     .await;
   let upload = match res {
@@ -341,7 +346,7 @@ async fn handle_put(
       .client
       .upload_part()
       .bucket(ctx.bucket.clone())
-      .key(path_enc.clone())
+      .key(object_key.clone())
       .upload_id(upload.upload_id().unwrap())
       .part_number(part_no)
       .body(ByteStream::from(cipher_part_data))
@@ -363,7 +368,7 @@ async fn handle_put(
     .client
     .complete_multipart_upload()
     .bucket(ctx.bucket.clone())
-    .key(path_enc.clone())
+    .key(object_key.clone())
     .upload_id(upload.upload_id().unwrap())
     .multipart_upload(
       CompletedMultipartUploadBuilder::default()
@@ -400,11 +405,15 @@ struct Cli {
   #[arg(long)]
   bucket: String,
 
-  /// Interface for server to listen on. Defaults to 127.0.0.1.
+  /// Interface for server to listen on.
   #[arg(long, default_value = "127.0.0.1")]
   interface: Ipv4Addr,
 
-  /// Port for server to listen on. Defaults to 6001.
+  /// Optional prefix of all destination S3 object keys. WARNING: This will not be encrypted!
+  #[arg(long, default_value_t = String::new())]
+  object_key_public_prefix: String,
+
+  /// Port for server to listen on.
   #[arg(long, default_value_t = 6001)]
   port: u16,
 }
@@ -423,6 +432,7 @@ async fn main() {
   let ctx = Arc::new(Ctx {
     bucket: cli.bucket,
     client,
+    object_key_public_prefix: cli.object_key_public_prefix,
     // For extra security, use two different key data instead of the same key data. We use SHA-512 for our PBKDF2 anyway, which outputs in 64-byte blocks, so we may as well use them.
     path_hkdf: Hkdf::new(None, &path_master_key),
     content_hkdf: Hkdf::new(None, &content_master_key),
